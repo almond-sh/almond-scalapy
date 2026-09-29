@@ -1,0 +1,12 @@
+.bsp/
+.DS_Store
+.idea/
+.bloop
+.vscode/
+.metals/
+
+# mill stuff
+out/
+
+# uv virtual environment of the examples
+examples/.venv/

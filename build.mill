@@ -1,0 +1,212 @@
+//| mill-version: 2.0.0-M2
+//| mvnDeps:
+//| - com.github.lolgab:mill-mima_mill1_3:0.2.2
+
+package build
+
+import com.github.lolgab.mill.mima.*
+import coursier.version.Version
+import mill.*
+import mill.api.*
+import mill.javalib.publish.*
+import mill.scalalib.*
+
+object ScalaVersions {
+  // Modules are built once per binary Scala version, with the oldest full Scala version the
+  // almond kernels support for it: Scala 2 patch releases are only forward binary compatible, so
+  // building almond-scalapy_2.13 with 2.13.3 gives an artifact all the 2.13.x versions can use,
+  // while building it with 2.13.18 wouldn't. For Scala 3, the LTS plays that role, its TASTy files
+  // being readable by all the later Scala 3 versions.
+  def scala3Compat   = "3.3.8"  // scala-steward:off
+  def scala213Oldest = "2.13.3" // scala-steward:off
+  def scala212Oldest = "2.12.8" // scala-steward:off
+
+  val all = Seq(scala3Compat, scala213Oldest, scala212Oldest)
+
+  /** The JVM to run the compiler of a Scala version on, when the one Mill runs on is too recent for
+    * it: the Scala 2.12.x before 2.12.18 and the 2.13.x before 2.13.11 can't read the class files
+    * of JDK 21.
+    */
+  def jvmVersionFor(sv: String): Option[String] = {
+    val needsJvm17 =
+      (sv.startsWith("2.12.") && Version(sv) < Version("2.12.18")) ||
+      (sv.startsWith("2.13.") && Version(sv) < Version("2.13.11"))
+    if (needsJvm17) Some("17")
+    else None
+  }
+}
+
+object Deps {
+  def jvmRepr = mvn"com.github.jupyter:jvm-repr:0.4.0"
+  def scalapy = mvn"me.shadaj::scalapy-core:0.5.2"
+}
+
+object Publishing {
+
+  /** The last version of almond-scalapy published from the almond repository, where it used to
+    * live, and the one snapshot versions are derived from as long as we have no tag of our own.
+    */
+  def lastAlmondVersion = "0.15.0"
+
+  /** The versions of almond-scalapy published from the almond repository, that MiMa checks us
+    * against
+    */
+  def almondVersions = Seq(
+    "0.14.1",
+    "0.14.2",
+    "0.14.3",
+    "0.14.4",
+    "0.14.5",
+    lastAlmondVersion
+  )
+
+  private def git(args: String*): Option[String] = {
+    val res = os.proc("git", args).call(stderr = os.Pipe, check = false)
+    if (res.exitCode == 0) Some(res.out.trim()).filter(_.nonEmpty)
+    else None
+  }
+
+  def exactTagVersion(): Option[String] =
+    git("describe", "--exact-match", "--tags", "--match", "v*", "HEAD")
+      .map(_.stripPrefix("v"))
+
+  def latestTaggedVersion(): String =
+    git("describe", "--abbrev=0", "--tags", "--match", "v*")
+      .map(_.stripPrefix("v"))
+      .getOrElse(lastAlmondVersion)
+
+  def computeVersion(): String =
+    exactTagVersion().getOrElse {
+      // No "v*" tag on HEAD - derive the next snapshot version from the latest one
+      val latest = latestTaggedVersion()
+      val fields = latest.split('.').take(3)
+      assert(
+        fields.length == 3,
+        s"Expected the latest version ($latest) to have at least 3 '.'-separated fields"
+      )
+      val lastField = fields(2).takeWhile(_.isDigit)
+      assert(
+        lastField.nonEmpty,
+        s"Expected the third field of the latest version ($latest) to start with a number"
+      )
+      fields.update(2, (lastField.toInt + 1).toString)
+      fields.mkString(".") + "-SNAPSHOT"
+    }
+
+  private def stable(ver: String): Boolean =
+    ver.exists(c => c != '0' && c != '.') &&
+    ver
+      .replace("-RC", "-")
+      .forall(c => c == '.' || c == '-' || c.isDigit)
+
+  /** The versions tagged in this repository before the one of HEAD */
+  def previousTaggedVersions(): Seq[String] = {
+    val current = exactTagVersion()
+    git("tag", "--merged", "HEAD", "--list", "v*")
+      .toSeq
+      .flatMap(_.linesIterator)
+      .map(_.trim.stripPrefix("v"))
+      .filter(stable)
+      .filter(v => !current.contains(v))
+  }
+}
+
+trait AlmondScalaPy extends CrossSbtModule with PublishModule with Mima {
+  def mvnDeps = Seq(
+    Deps.jvmRepr
+  )
+  def compileMvnDeps = Seq(
+    Deps.scalapy
+  )
+
+  // jvm-repr is only published on JitPack
+  def repositories = Task {
+    super.repositories() ++ Seq("jitpack")
+  }
+
+  def jvmVersion = Task {
+    ScalaVersions.jvmVersionFor(scalaVersion()).getOrElse(super.jvmVersion())
+  }
+
+  /** Patched compiler classes, that go ahead of scalac's own on its class path */
+  private def scalacPatches: Seq[JavaModule] =
+    if (crossValue == `scalac-jrt-patch`.scalaVersion0) Seq(`scalac-jrt-patch`)
+    else Nil
+
+  def scalaCompilerClasspath = Task {
+    Task.traverse(scalacPatches)(_.jar)() ++ super.scalaCompilerClasspath()
+  }
+
+  def javacOptions = super.javacOptions() ++ Seq(
+    "--release",
+    "8"
+  )
+  def scalacOptions = Task {
+    // see http://tpolecat.github.io/2017/04/25/scalac-flags.html
+    val sv = Version(scalaVersion())
+    val scala2Options =
+      if (scalaVersion().startsWith("2.")) Seq("-explaintypes")
+      else Nil
+    // Target the oldest JVM we support - -release only works from 2.12.12
+    val jvmTargetOptions =
+      if (sv < Version("2.12.12")) Seq("-target:jvm-1.8")
+      else Seq("--release", "8")
+    super.scalacOptions() ++ scala2Options ++ jvmTargetOptions ++ Seq(
+      "-deprecation",
+      "-feature",
+      "-encoding",
+      "utf-8",
+      "-language:higherKinds",
+      "-unchecked"
+    )
+  }
+
+  def pomSettings = PomSettings(
+    description = artifactName(),
+    organization = "sh.almond",
+    url = "https://github.com/almond-sh/almond-scalapy",
+    licenses = Seq(License.`BSD-3-Clause`),
+    versionControl = VersionControl.github("almond-sh", "almond-scalapy"),
+    developers = Seq(
+      Developer("alexarchambault", "Alex Archambault", "https://github.com/alexarchambault")
+    )
+  )
+  def publishVersion = Task.Input {
+    Publishing.computeVersion()
+  }
+
+  // We don't publish any documentation, publish empty doc JARs
+  def docJar = Task {
+    val dest = Task.dest / "empty.jar"
+    val zos  = new java.util.zip.ZipOutputStream(os.write.outputStream(dest))
+    zos.finish()
+    zos.close()
+    PathRef(dest)
+  }
+
+  def mimaPreviousVersions = Task.Input {
+    Publishing.almondVersions ++ Publishing.previousTaggedVersions()
+  }
+}
+
+object `almond-scalapy` extends Cross[AlmondScalaPy](ScalaVersions.all)
+
+/** A patched JrtClassPath for scalac 2.12.8, letting it expand macros on JDK 15+.
+  *
+  * The macro class loader of scalac 2.12.8 is built from the URLs of its class path, and its
+  * JrtClassPath hands it the URI of the jrt:/packages directory, which JDK 15+ reject: any macro
+  * expansion fails with "/packages cannot be represented as URI". 2.12.9 fixed that, but 2.12.8 is
+  * the oldest Scala 2.12 version the almond kernels support, and the one we build our 2.12
+  * artifacts with. Mill only runs scalac on JDK 17+, so we compile this copy of 2.12.8's
+  * JrtClassPath with the fix of 2.12.9, and put it ahead of scala-compiler on the class path of
+  * scalac 2.12.8.
+  */
+object `scalac-jrt-patch` extends ScalaModule {
+  def scalaVersion0 = "2.12.8"
+  def scalaVersion  = scalaVersion0
+  // The oldest JVM Mill runs scalac on - the one ScalaVersions.jvmVersionFor picks for 2.12.8
+  def jvmVersion = "17"
+  def compileMvnDeps = Seq(
+    mvn"org.scala-lang:scala-compiler:$scalaVersion0"
+  )
+}

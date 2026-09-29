@@ -1,0 +1,186 @@
+package build.examples
+
+import coursier.cache.ArchiveCache
+import coursier.util.Artifact
+import mill.*
+import mill.api.*
+import mill.javalib.api.JvmWorkerUtil
+import mill.scalalib.*
+
+import java.io.File
+import java.util.Locale
+
+import scala.util.Properties
+
+/** The example notebooks, run with released almond kernels using the almond-scalapy of this
+  * repository.
+  *
+  * The notebooks of `notebooks/scala-<binary Scala version>` are run with the kernel of [[kernel]]
+  * for that binary Scala version, and their outputs compared with the ones they were committed
+  * with.
+  */
+object `package` extends Module {
+
+  /** The almond version whose kernels run the notebooks */
+  def almondVersion = "0.15.0"
+
+  /** The Scala versions the notebooks are run with, one per binary Scala version we publish for */
+  def scalaVersions = Seq("2.12.21", "2.13.18", "3.9.0")
+
+  def uvVersion = "0.12.18"
+
+  /** Paths put in cached task values have to be the real ones: the ones of Mill no-daemon runs go
+    * through a symlink that only lives as long as the run.
+    */
+  def realPath(path: os.Path): String =
+    path.toNIO.toRealPath().toString
+
+  /** A local Maven repository, with almond-scalapy published in it for all Scala versions */
+  def localRepo: T[PathRef] = {
+    val repos = Task.sequence(build.`almond-scalapy`.crossModules.map(_.publishLocalTestRepo))
+    Task {
+      for (repo <- repos(); elem <- os.list(repo.path))
+        os.copy.into(elem, Task.dest, mergeFolders = true)
+      PathRef(Task.dest)
+    }
+  }
+
+  def almondScalapyVersion = Task {
+    build.`almond-scalapy`(build.ScalaVersions.scala213Oldest).publishVersion()
+  }
+
+  /** An almond kernel, running a specific Scala version */
+  object kernel extends Cross[Kernel](scalaVersions)
+  trait Kernel extends Cross.Module[String] with ScalaModule {
+    def scalaVersion = crossValue
+    // The JVM the kernel runs on
+    def jvmVersion = "21"
+
+    /** The id of the Jupyter kernel installed for us, also the name of our notebook directory */
+    def kernelId =
+      if (JvmWorkerUtil.isScala3(crossValue)) "scala-3"
+      else "scala-" + crossValue.split('.').take(2).mkString(".")
+
+    // almond depends on jvm-repr, only published on JitPack
+    def repositories = Task {
+      super.repositories() ++ Seq("jitpack")
+    }
+    def mvnDeps = Seq(
+      mvn"sh.almond::scala-kernel:$almondVersion",
+      if (JvmWorkerUtil.isScala3(crossValue)) mvn"org.scala-lang::scala3-compiler:$crossValue"
+      else mvn"org.scala-lang:scala-compiler:$crossValue"
+    ) ++ jna
+
+    // The almond 0.15.0 kernels for Scala 2.13 tell Ammonite that JNA is on their class path, so
+    // that it leaves it out of the dependencies users add, like ScalaPy: their list of
+    // dependencies is computed with Scala 2.13.3, whose jline depends on JNA. The jline of the
+    // later Scala 2.13 versions doesn't any more, so we add JNA ourselves, in the version that list
+    // has. The almond versions after 0.15.0 ship a list per Scala version - drop this when
+    // bumping almondVersion.
+    private def jna =
+      if (crossValue.startsWith("2.13.")) Seq(mvn"net.java.dev.jna:jna:5.3.1")
+      else Nil
+
+    // The kernel is built with the oldest Scala version of its binary version, force ours, so that
+    // it runs - and compiles the notebook cells - with it. Mill forces the Scala artifacts whose
+    // name it can spell out without the Scala 3 suffix, the Scala 3 ones are added here.
+    def resolutionParams = Task.Anon {
+      val org      = coursier.Organization(JvmWorkerUtil.scalaOrganization(crossValue))
+      val suffixes = if (JvmWorkerUtil.isScala3(crossValue)) Seq("", "_3") else Seq("")
+      super.resolutionParams().addForceVersion0(
+        Lib.scalaArtifacts(crossValue).toSeq.sorted.flatMap { name =>
+          suffixes.map { suffix =>
+            coursier.Module(org, coursier.ModuleName(name + suffix), Map.empty) ->
+              coursier.version.VersionConstraint(crossValue)
+          }
+        }*
+      )
+    }
+
+    /** The kernel spec of this kernel, as a kernel.json content */
+    def kernelSpec = Task {
+      val java      = javaHome().getOrElse(sys.error("No JVM for the kernel")).path / "bin" / "java"
+      val classPath = resolvedRunMvnDeps().map(ref => realPath(ref.path))
+      val argv = Seq(
+        realPath(java),
+        "-cp",
+        classPath.mkString(File.pathSeparator),
+        "almond.ScalaKernel",
+        "--connection-file",
+        "{connection_file}",
+        // Load almond-scalapy from our local repository, with the version we just built
+        "--extra-repository",
+        localRepo().path.toNIO.toRealPath().toUri.toASCIIString,
+        "--default-almond-scalapy-version",
+        almondScalapyVersion(),
+        // Don't send the output of println and the like to the notebooks
+        "--trap-output"
+      )
+      ujson.Obj(
+        "argv"         -> argv,
+        "display_name" -> s"Scala $crossValue",
+        "language"     -> "scala"
+      ).render(2)
+    }
+  }
+
+  /** A Jupyter data directory, with our kernels installed in it */
+  def jupyterPath: T[PathRef] = Task {
+    val specs = Task.traverse(kernel.crossModules)(k => Task.Anon((k.kernelId, k.kernelSpec())))()
+    for ((id, spec) <- specs)
+      os.write(Task.dest / "kernels" / id / "kernel.json", spec, createFolders = true)
+    PathRef(Task.dest)
+  }
+
+  def notebooksDir = Task.Source("notebooks")
+
+  /** The uv project describing the Jupyter environment the notebooks are run with */
+  def uvProject = Task.Sources("pyproject.toml", "uv.lock", ".python-version")
+
+  /** A uv launcher, downloaded from its GitHub releases */
+  def uv = Task {
+    val arch = sys.props.getOrElse("os.arch", "").toLowerCase(Locale.ROOT) match {
+      case "amd64" | "x86_64"  => "x86_64"
+      case "aarch64" | "arm64" => "aarch64"
+      case other               => sys.error(s"Unsupported CPU architecture for uv: $other")
+    }
+    val target =
+      if (Properties.isWin) s"$arch-pc-windows-msvc"
+      else if (Properties.isMac) s"$arch-apple-darwin"
+      else s"$arch-unknown-linux-gnu"
+    val ext = if (Properties.isWin) "zip" else "tar.gz"
+    val url = s"https://github.com/astral-sh/uv/releases/download/$uvVersion/uv-$target.$ext"
+    val archiveCache = ArchiveCache[coursier.util.Task]()
+    val dir = archiveCache.get(Artifact(url)).unsafeRun()(using archiveCache.cache.ec) match {
+      case Left(err)  => throw new Exception(s"Error downloading $url", err)
+      case Right(dir) => os.Path(dir.getAbsoluteFile)
+    }
+    val name = if (Properties.isWin) "uv.exe" else "uv"
+    // The tar.gz archives have a top-level "uv-<target>" directory, the zip ones don't
+    val path = Seq(dir / name, dir / s"uv-$target" / name).find(os.exists(_)).getOrElse {
+      sys.error(s"$name not found in $url (extracted under $dir)")
+    }
+    realPath(path)
+  }
+
+  object test extends ScalaModule with TestModule.Munit {
+    def scalaVersion = build.ScalaVersions.scala3Compat
+    def mvnDeps = Seq(
+      mvn"org.scalameta::munit:1.3.6",
+      mvn"com.lihaoyi::os-lib:0.11.8",
+      mvn"com.lihaoyi::ujson:4.4.3"
+    )
+    def forkArgs = Task {
+      uvProject()
+      val outputDir = Task.dest / "output"
+      os.makeDir.all(outputDir)
+      super.forkArgs() ++ Seq(
+        s"-Dalmond.scalapy.examples.notebooks=${realPath(notebooksDir().path)}",
+        s"-Dalmond.scalapy.examples.uv-project=${realPath(moduleDir / os.up)}",
+        s"-Dalmond.scalapy.examples.uv=${uv()}",
+        s"-Dalmond.scalapy.examples.jupyter-path=${realPath(jupyterPath().path)}",
+        s"-Dalmond.scalapy.examples.output-dir=${realPath(outputDir)}"
+      )
+    }
+  }
+}
